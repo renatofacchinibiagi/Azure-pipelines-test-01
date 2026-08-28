@@ -79,6 +79,34 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
+## 4. GitHub Actions com OIDC
+
+O workflow em `.github/workflows/terraform.yml` usa OIDC para autenticar na Azure sem `client secret`.
+
+Antes de executar a pipeline, crie estas variables no GitHub em **Settings > Secrets and variables > Actions > Variables**:
+
+| Variable | Valor |
+| --- | --- |
+| `AZURE_CLIENT_ID` | Client ID da managed identity usada pelo GitHub Actions |
+| `AZURE_TENANT_ID` | Tenant ID retornado por `az account show --query tenantId -o tsv` |
+| `AZURE_SUBSCRIPTION_ID` | Subscription ID retornado por `az account show --query id -o tsv` |
+| `TF_STATE_RESOURCE_GROUP_NAME` | `rg-azure-pipelines-test-01` |
+| `TF_STATE_STORAGE_ACCOUNT_NAME` | Output `storage_account_name` do bootstrap |
+| `TF_STATE_CONTAINER_NAME` | `tfstate` |
+| `TF_STATE_KEY` | `network/terraform.tfstate` |
+
+O workflow executa automaticamente em pull requests e pushes para `main`:
+
+- `terraform fmt -check -recursive`
+- Criacao temporaria de um `backend.tf` no runner
+- `terraform init` com backend remoto no Azure Storage
+- `terraform validate`
+- `terraform plan -out=tfplan`
+
+O `terraform apply` nao roda automaticamente em push. Para aplicar pela pipeline, abra **Actions > Terraform > Run workflow**, selecione a branch `main`, marque `apply` como `true` e execute manualmente.
+
+Nao crie `AZURE_CLIENT_SECRET`. Com OIDC, a autenticacao usa a federated credential criada na managed identity.
+
 ## Variaveis principais
 
 Na raiz:
