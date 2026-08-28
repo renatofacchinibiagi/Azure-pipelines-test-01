@@ -4,6 +4,7 @@ Infraestrutura Azure com Terraform para criar:
 
 - Um resource group: `rg-azure-pipelines-test-01`
 - Uma virtual network: `vnet-azure-pipelines-test-01`
+- Uma subnet: `snet-azure-pipelines-test-01`
 - Um bootstrap de backend remoto com Storage Account e container Blob para `tfstate`
 
 ## Estrutura
@@ -12,7 +13,7 @@ Infraestrutura Azure com Terraform para criar:
 .
 ├── bootstrap/              # Cria o RG, Storage Account e container do tfstate
 ├── backend.tf.example      # Exemplo para configurar o backend remoto da infra principal
-├── main.tf                 # Cria a VNet no RG criado pelo bootstrap
+├── main.tf                 # Cria a VNet e a subnet no RG criado pelo bootstrap
 ├── outputs.tf
 ├── providers.tf
 ├── variables.tf
@@ -114,6 +115,8 @@ Na raiz:
 - `resource_group_name`: padrao `rg-azure-pipelines-test-01`
 - `virtual_network_name`: padrao `vnet-azure-pipelines-test-01`
 - `vnet_address_space`: padrao `["10.10.0.0/16"]`
+- `subnet_name`: padrao `snet-azure-pipelines-test-01`
+- `subnet_address_prefixes`: padrao `["10.10.1.0/24"]`
 - `tags`: tags aplicadas na VNet
 
 No bootstrap:
