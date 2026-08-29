@@ -9,15 +9,20 @@ Este repositorio cria:
 - Subnet: `snet-azure-pipelines-test-01`
 - Storage Account e container Blob para backend remoto do Terraform state
 - Pipeline GitHub Actions com autenticacao OIDC na Azure
+- Azure Container Registry (ACR) para guardar imagens Docker
+- Managed Identity dedicada para o Container Instance puxar imagens do ACR sem senha
+- Azure Container Instance (ACI) rodando uma aplicacao HTML simples empacotada em Docker
 
 ## Como O Projeto Esta Organizado
 
 ```text
 .
 ├── .github/workflows/terraform.yml  # Pipeline GitHub Actions para Terraform
+├── app/index.html                   # Aplicacao HTML simples usada no container
+├── Dockerfile                       # Empacota app/index.html com nginx
 ├── bootstrap/                       # Cria RG, Storage Account e container do tfstate
 ├── backend.tf.example               # Modelo local de backend remoto
-├── main.tf                          # Cria VNet e subnet no RG criado pelo bootstrap
+├── main.tf                          # Cria VNet, subnet, ACR, identity e Container Instance
 ├── outputs.tf                       # Outputs da infraestrutura principal
 ├── providers.tf                     # Provider AzureRM
 ├── variables.tf                     # Variaveis da infraestrutura principal
@@ -289,7 +294,192 @@ Para aplicar uma mudanca na Azure pela pipeline:
 
 Se a infraestrutura ja estiver igual ao codigo, o plan/apply deve mostrar que nao ha mudancas. Se houver alteracao no codigo, o plan mostra o que sera criado, alterado ou removido antes do apply.
 
-## 10. Variaveis Terraform
+## 10. Docker Local: Build E Execucao Da Aplicacao
+
+A aplicacao deste lab e uma pagina HTML simples em `app/index.html`, empacotada com nginx via `Dockerfile`.
+
+Pre-requisito: Docker Desktop instalado e com o Engine rodando (`Engine running` no proprio app).
+
+Build da imagem:
+
+```powershell
+docker build -t azure-pipelines-test-01:v1 .
+```
+
+Execucao local:
+
+```powershell
+docker run -d -p 8080:80 azure-pipelines-test-01:v1
+```
+
+Abra `http://localhost:8080` no navegador. Para parar:
+
+```powershell
+docker ps
+docker stop <CONTAINER_ID>
+```
+
+Nesse ponto, a aplicacao roda 100% local. A Azure ainda nao esta envolvida.
+
+## 11. Azure Container Registry E Azure Container Instance
+
+Alem de VNet e subnet, o `main.tf` cria mais 4 recursos para rodar essa aplicacao na Azure:
+
+- `azurerm_container_registry.main`: o ACR, com `admin_enabled = false` (sem senha de admin)
+- `azurerm_user_assigned_identity.aci`: uma Managed Identity dedicada, usada apenas para o Container Instance autenticar no ACR
+- `azurerm_role_assignment.aci_acr_pull`: da a role `AcrPull` para essa identity, escopada no ACR
+- `azurerm_container_group.main`: o Azure Container Instance (ACI), que roda o container publicamente na porta 80, usando a identity acima para puxar a imagem sem senha
+
+Esse padrao repete o mesmo principio usado no GitHub Actions com OIDC: nenhum servico usa senha fixa, cada um tem uma identidade dedicada com a role minima necessaria.
+
+Como o Container Instance depende de uma imagem que ainda nao existe no primeiro apply, a criacao e feita em duas etapas, explicadas abaixo.
+
+## 12. Aplicar Apenas ACR, Identity E Role Assignment
+
+Na raiz do projeto:
+
+```powershell
+terraform plan -target azurerm_container_registry.main -target azurerm_user_assigned_identity.aci -target azurerm_role_assignment.aci_acr_pull -out=tfplan
+terraform apply tfplan
+```
+
+Isso cria o ACR e a identity, sem tentar criar o Container Instance ainda.
+
+## 13. Dar A Voce Mesmo Permissao De Push No ACR
+
+Como o ACR nao tem admin/senha, seu proprio usuario tambem precisa de uma role de dados para enviar imagens.
+
+Pelo Azure CLI:
+
+```powershell
+$USER_OBJECT_ID = az ad signed-in-user show --query id -o tsv
+$ACR_RESOURCE_ID = az acr show --name (terraform output -raw acr_name) --query id -o tsv
+
+az role assignment create --assignee $USER_OBJECT_ID --role AcrPush --scope $ACR_RESOURCE_ID
+```
+
+Ou pelo Portal Azure: abra o ACR, va em **Access control (IAM)**, **Add role assignment**, escolha a role `AcrPush`, selecione seu proprio usuario em **Select members** e confirme em **Review + assign**.
+
+## 14. Build, Tag E Push Da Imagem Para O ACR
+
+Login no ACR usando sua propria conta Azure:
+
+```powershell
+az acr login --name (terraform output -raw acr_name)
+```
+
+Criar a tag apontando para o ACR e enviar a imagem:
+
+```powershell
+$ACR_LOGIN_SERVER = terraform output -raw acr_login_server
+docker tag azure-pipelines-test-01:v1 "$ACR_LOGIN_SERVER/azure-pipelines-test-01:v1"
+docker push "$ACR_LOGIN_SERVER/azure-pipelines-test-01:v1"
+```
+
+Esse nome final precisa bater com as variaveis `container_image_name` e `container_image_tag` usadas no `main.tf`.
+
+## 15. Aplicar O Container Instance
+
+Com a imagem ja no ACR, aplique o restante:
+
+```powershell
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+Isso cria o `azurerm_container_group.main`. Para ver a URL publica:
+
+```powershell
+terraform output aci_fqdn
+```
+
+Abra essa URL no navegador. A pagina passa a ser servida pela Azure, nao mais pelo seu computador. Para confirmar isso, pare o container local (`docker stop`) e recarregue a URL: ela deve continuar respondendo.
+
+## 16. Atualizando A Aplicacao Para Uma Nova Versao
+
+Fluxo para publicar uma nova versao da aplicacao:
+
+1. Edite `app/index.html`
+2. Gere uma nova imagem local, com tag nova:
+
+```powershell
+docker build -t azure-pipelines-test-01:v2 .
+```
+
+3. Teste local antes de enviar (boa pratica):
+
+```powershell
+docker run -d -p 8081:80 azure-pipelines-test-01:v2
+```
+
+4. Login, tag e push da nova versao:
+
+```powershell
+az acr login --name (terraform output -raw acr_name)
+docker tag azure-pipelines-test-01:v2 "$(terraform output -raw acr_login_server)/azure-pipelines-test-01:v2"
+docker push "$(terraform output -raw acr_login_server)/azure-pipelines-test-01:v2"
+```
+
+5. Atualize `variables.tf`, mudando o default de `container_image_tag` para `"v2"`
+
+6. Aplique novamente:
+
+```powershell
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+O Terraform substitui o Container Instance (Container Instance nao suporta troca de imagem em tempo real), recriando-o ja com a nova imagem.
+
+## 17. Encerrar Recursos Para Nao Gerar Custo
+
+O Azure Container Instance cobra por segundo enquanto estiver rodando. O ACR e a Storage Account do state tem custo baixo, porem fixo, enquanto existirem.
+
+Para pausar sem perder o trabalho feito no ACR:
+
+```powershell
+terraform destroy -target azurerm_container_group.main
+```
+
+Isso remove somente o Container Instance. VNet, subnet, ACR, identities e as imagens ja enviadas continuam intactos. Para recriar o container depois:
+
+```powershell
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+Para remover tudo criado neste diretorio (exceto o bootstrap):
+
+```powershell
+terraform destroy
+```
+
+O `bootstrap/` (resource group + Storage Account do state) e gerenciado separadamente:
+
+```powershell
+terraform -chdir=bootstrap destroy
+```
+
+## 18. Proximo Passo: Build E Push Dentro Do GitHub Actions
+
+Hoje o build/push da imagem Docker e feito manualmente. O proximo passo natural e mover isso para dentro do workflow `.github/workflows/terraform.yml`, ainda nao implementado neste repositorio.
+
+Ideia geral da pipeline com Docker:
+
+```text
+1. Push no GitHub
+2. GitHub Actions autentica na Azure via OIDC (ja configurado)
+3. Workflow faz docker build da imagem
+4. Workflow faz login no ACR usando a mesma identidade OIDC
+5. Workflow faz docker tag usando o SHA do commit, em vez de v1/v2 manuais
+6. Workflow faz docker push para o ACR
+7. Terraform aplica, recebendo a tag da imagem via variavel dinamica:
+   terraform apply -var="container_image_tag=<sha-do-commit>" tfplan
+```
+
+Para isso funcionar, a Managed Identity do GitHub Actions (`id-github-actions-azure-pipelines-test-01`) tambem precisaria da role `AcrPush`, escopada no ACR, do mesmo jeito que foi dada ao usuario no passo 13.
+
+## 19. Variaveis Terraform
 
 Na raiz:
 
@@ -298,7 +488,14 @@ Na raiz:
 - `vnet_address_space`: padrao `["10.10.0.0/16"]`
 - `subnet_name`: padrao `snet-azure-pipelines-test-01`
 - `subnet_address_prefixes`: padrao `["10.10.1.0/24"]`
-- `tags`: tags aplicadas na VNet
+- `acr_name`: opcional; se nao informar, o Terraform gera um nome valido com sufixo aleatorio
+- `acr_sku`: padrao `Basic`
+- `container_image_name`: padrao `azure-pipelines-test-01`
+- `container_image_tag`: padrao `v2`
+- `container_cpu`: padrao `0.5`
+- `container_memory_gb`: padrao `1`
+- `aci_dns_name_label`: opcional; se nao informar, o Terraform gera um prefixo unico com sufixo aleatorio
+- `tags`: tags aplicadas aos recursos
 
 No bootstrap:
 
@@ -307,7 +504,7 @@ No bootstrap:
 - `storage_account_name`: opcional; se nao informar, o Terraform gera um nome valido com sufixo aleatorio
 - `state_container_name`: padrao `tfstate`
 
-## 11. Boas Praticas De Git
+## 20. Boas Praticas De Git
 
 O `.gitignore` foi configurado para ignorar:
 
@@ -325,6 +522,29 @@ Antes de fazer commit, confira:
 git status --short
 ```
 
-Devem ir para o Git arquivos como `.tf`, `.terraform.lock.hcl`, `.github/workflows/terraform.yml`, `backend.tf.example` e `README.md`.
+Devem ir para o Git arquivos como `.tf`, `.terraform.lock.hcl`, `.github/workflows/terraform.yml`, `backend.tf.example`, `Dockerfile`, `app/index.html` e `README.md`.
 
 Nao devem ir para o Git arquivos como `backend.tf`, `terraform.tfstate`, `*.tfplan` e diretorios `.terraform/`.
+
+## 21. Proximos Estudos: Kubernetes E Escala Maior
+
+Este lab hoje cobre o fluxo completo de container em um unico recurso:
+
+```text
+GitHub -> Docker build/push manual -> ACR -> Azure Container Instance -> URL publica
+```
+
+Para uma aplicacao real, com multiplas replicas, autoscaling e alta disponibilidade, os proximos passos comuns sao:
+
+**Azure Container Apps**: roda containers com multiplas replicas e autoscaling gerenciado (baseado em CPU, memoria ou numero de requisicoes HTTP), sem precisar administrar um cluster Kubernetes diretamente. E o proximo passo mais natural depois do Container Instance.
+
+**AKS (Azure Kubernetes Service)**: cluster Kubernetes gerenciado pela Azure. Da controle total via recursos nativos do Kubernetes, como o Horizontal Pod Autoscaler (HPA), mas exige gerenciar nos, deployments, services e ingress.
+
+Com Terraform, evoluir para Container Apps envolveria criar um `Container Apps Environment` e um `Container App` reaproveitando a mesma VNet/subnet e o mesmo ACR ja criados neste lab. Evoluir para AKS envolveria criar um cluster (`azurerm_kubernetes_cluster`) e node pools, tambem reaproveitando VNet, subnet e ACR.
+
+Ordem recomendada de estudo a partir daqui:
+
+1. Automatizar build/push no GitHub Actions (secao 18)
+2. Migrar do Container Instance para Azure Container Apps
+3. Adicionar dominio proprio e HTTPS
+4. Estudar Kubernetes e AKS
